@@ -3,13 +3,9 @@ import cors from "cors";
 import { spawn } from "child_process";
 import archiver from "archiver";
 import util from "util";
-import { exec } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
 
-import express from "express";
-import { exec } from "child_process";
-import path from "path";
 import fs from "fs";
 
 const app = express();
