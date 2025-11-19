@@ -7,114 +7,54 @@ import { exec } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
 
-const execPromise = util.promisify(exec);
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import express from "express";
+import { exec } from "child_process";
+import path from "path";
+import fs from "fs";
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "200mb" }));
+app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.send("Extractor API running... 🚀 Use POST /extract (JSON: { url, maxFrames, interval, format })");
-});
+app.post("/download", async (req, res) => {
+  const { url } = req.body;
 
-app.post("/extract", async (req, res) => {
-  const { url, maxFrames = 100, interval = "auto", format = "png" } = req.body;
+  if (!url) {
+    return res.status(400).json({ error: "No URL provided" });
+  }
 
-  if (!url) return res.status(400).send("Missing 'url' field");
+  const outputFile = `video_${Date.now()}.mp4`;
+  const filePath = path.join("/app", outputFile);
 
-  try {
-    console.log("Downloading URL:", url);
+  // ⚠️ yt-dlp command WITHOUT cookies (safe mode)
+  // Works for all public YouTube videos
+  const command = `yt-dlp -f "best[ext=mp4]" -o "${filePath}" "${url}"`;
 
-    const cookiesPath = path.join(__dirname, "cookies.txt");
+  console.log("Running:", command);
 
-    // 1️⃣ Download using yt-dlp + cookies
-    const downloadCmd = `yt-dlp --cookies "${cookiesPath}" -o video.mp4 "${url}"`;
+  exec(command, (err, stdout, stderr) => {
+    if (err) {
+      console.error("yt-dlp error:", stderr);
+      return res.status(500).json({
+        error: "Failed to download",
+        details: stderr,
+      });
+    }
 
-    console.log("Running:", downloadCmd);
+    console.log("yt-dlp output:", stdout);
 
-    await execPromise(downloadCmd);
+    if (!fs.existsSync(filePath)) {
+      return res.status(500).json({ error: "File not created" });
+    }
 
-    console.log("Video downloaded.");
-
-    // 2️⃣ Setup ZIP output
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
-
-    const archive = archiver("zip");
-    archive.pipe(res);
-
-    // 3️⃣ Start ffmpeg for frame extraction
-    const codec = format === "jpg" ? "mjpeg" : "png";
-    const fpsArg = interval !== "auto" ? `fps=1/${interval}` : "fps=1/5";
-
-    const ffArgs = [
-      "-i", "video.mp4",
-      "-vf", fpsArg,
-      "-frames:v", String(maxFrames),
-      "-f", "image2pipe",
-      "-vcodec", codec,
-      "pipe:1"
-    ];
-
-    const ff = spawn("ffmpeg", ffArgs);
-
-    let acc = Buffer.alloc(0);
-    let count = 0;
-
-    const JPG_SOI = Buffer.from([0xFF, 0xD8]);
-    const JPG_EOI = Buffer.from([0xFF, 0xD9]);
-    const PNG_SIG = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-
-    ff.stdout.on("data", chunk => {
-      acc = Buffer.concat([acc, chunk]);
-
-      if (format === "png") {
-        let idx;
-        while ((idx = acc.indexOf(PNG_SIG)) !== -1) {
-          let next = acc.indexOf(PNG_SIG, idx + PNG_SIG.length);
-          if (next === -1) break;
-
-          const frame = acc.slice(idx, next);
-          acc = acc.slice(next);
-
-          count++;
-          archive.append(frame, { name: `frame_${String(count).padStart(4, "0")}.png` });
-        }
-      } else {
-        while (true) {
-          const soi = acc.indexOf(JPG_SOI);
-          const eoi = acc.indexOf(JPG_EOI, soi + 2);
-          if (soi === -1 || eoi === -1) break;
-
-          const frame = acc.slice(soi, eoi + 2);
-          acc = acc.slice(eoi + 2);
-
-          count++;
-          archive.append(frame, { name: `frame_${String(count).padStart(4, "0")}.jpg` });
-        }
+    res.download(filePath, (downloadErr) => {
+      fs.unlink(filePath, () => {}); // cleanup
+      if (downloadErr) {
+        console.error("Download error:", downloadErr);
       }
     });
-
-    ff.stderr.on("data", d => console.error("ffmpeg:", d.toString()));
-
-    ff.on("close", async () => {
-      console.log("FFmpeg done.");
-      if (!archive._finalized) await archive.finalize();
-    });
-
-    req.on("close", () => {
-      try { ff.kill("SIGTERM"); } catch {}
-      try { archive.abort(); } catch {}
-    });
-
-  } catch (err) {
-    console.error("Server error:", err);
-    res.status(500).send("Server error: " + err.message);
-  }
+  });
 });
 
-const PORT = process.env.PORT || 7860;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+// Port for Render
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
