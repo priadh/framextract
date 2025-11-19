@@ -1,19 +1,19 @@
+# Dockerfile
 FROM node:20-bullseye
 
-# Install system tools
-RUN apt-get update && apt-get install -y ffmpeg python3 python3-pip && rm -rf /var/lib/apt/lists/*
-
-# Install yt-dlp
-RUN pip3 install -U yt-dlp
+# install ffmpeg and tools
+RUN apt-get update && apt-get install -y ffmpeg ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# copy package files and install
 COPY package*.json ./
-RUN npm install
+RUN npm install --no-audit --no-fund
 
+# copy source
 COPY . .
 
-ENV PORT=10000
-EXPOSE 10000
+ENV PORT=7860
+EXPOSE 7860
 
 CMD ["node", "server.js"]
