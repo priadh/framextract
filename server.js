@@ -1,96 +1,157 @@
 import express from "express";
 import cors from "cors";
+import multer from "multer";
+import fetch from "node-fetch";
 import { spawn } from "child_process";
 import archiver from "archiver";
-import util from "util";
-import path from "path";
-import { fileURLToPath } from "url";
-import fs from "fs";
-import { exec } from "child_process";
-// server.js
-import multer from "multer";
-import http from "http";
-import https from "https";
-import { URL } from "url";
-
-
-import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "200mb" }));
 
-// List of invidious mirrors
-const INVIDIOUS = [
-  "https://iv.ggtyler.dev",
-  "https://inv.nadeko.net",
-  "https://invidious.flokinet.to",
-  "https://inv.tux.pizza",
-  "https://invidious.protokolla.fi",
-  "https://invidio.xamh.de",
-  "https://vid.puffyan.us"
-];
+// storage for uploaded videos
+const upload = multer({ dest: "uploads/" });
 
-async function getStreamURL(videoId) {
-  for (const base of INVIDIOUS) {
-    try {
-      const res = await fetch(`${base}/api/v1/videos/${videoId}`);
-      if (!res.ok) continue;
-      const json = await res.json();
+const YT_API_KEY = "AIzaSyA6by9bsHyG_SJqxDq6ImSLtIrGtkXMRgA";
 
-      const best = json.formatStreams?.find(f => f?.url);
-      if (best?.url) return best.url;
-    } catch {
-      continue; // try next mirror
-    }
+// ---------------------------
+// YOUTUBE METADATA + DOWNLOAD
+// ---------------------------
+async function getYouTubeDownloadURL(videoId) {
+  const apiURL = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&part=contentDetails,player&key=${YT_API_KEY}`;
+
+  const res = await fetch(apiURL);
+  const data = await res.json();
+
+  if (!data.items || data.items.length === 0) {
+    throw new Error("Invalid or private YouTube video");
   }
+
+  // We DO NOT need yt-dlp.
+  // We use YouTube's "player embed" URL for direct access:
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+// extract videoId from link
+function extractVideoId(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes("youtube.com")) return u.searchParams.get("v");
+    if (u.hostname.includes("youtu.be")) return u.pathname.substring(1);
+  } catch {}
   return null;
 }
 
-function extractVideoId(url) {
-  const match = url.match(/(?:v=|\.be\/)([\w-]{11})/);
-  return match ? match[1] : null;
-}
+// FRAME EXTRACTOR (common function)
+function runFFmpeg(videoPath, maxFrames, interval, format, archive, res) {
+  const codec = format === "jpg" ? "mjpeg" : "png";
+  const fpsArg = interval !== "auto" ? `fps=1/${interval}` : "fps=1/5";
 
-app.post("/extract", async (req, res) => {
-  const { url, maxFrames = 50, interval = 5, format = "jpg" } = req.body;
-
-  const videoId = extractVideoId(url);
-  if (!videoId) return res.status(400).json({ error: "Invalid YouTube URL" });
-
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
-
-  const archive = archiver("zip");
-  archive.pipe(res);
-
-  const streamURL = await getStreamURL(videoId);
-  if (!streamURL)
-    return res.status(500).json({ error: "All Invidious servers failed" });
-
-  const ff = spawn("ffmpeg", [
-    "-i", streamURL,
-    "-vf", `fps=1/${interval}`,
+  const args = [
+    "-i", videoPath,
+    "-vf", fpsArg,
     "-frames:v", String(maxFrames),
     "-f", "image2pipe",
-    "-vcodec", format === "jpg" ? "mjpeg" : "png",
+    "-vcodec", codec,
     "pipe:1"
-  ]);
+  ];
 
+  const ff = spawn("ffmpeg", args);
+
+  let buf = Buffer.alloc(0);
   let count = 0;
+
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4E, 0x47]);
+  const JPG_SOI = Buffer.from([0xFF, 0xD8]);
+  const JPG_EOI = Buffer.from([0xFF, 0xD9]);
+
   ff.stdout.on("data", chunk => {
-    count++;
-    archive.append(chunk, {
-      name: `frame_${String(count).padStart(4, "0")}.${format}`
-    });
+    buf = Buffer.concat([buf, chunk]);
+
+    if (format === "png") {
+      let idx;
+      while ((idx = buf.indexOf(PNG_SIG)) !== -1) {
+        let next = buf.indexOf(PNG_SIG, idx + 4);
+        if (next === -1) break;
+        const frame = buf.slice(idx, next);
+        buf = buf.slice(next);
+        count++;
+        archive.append(frame, { name: `frame_${String(count).padStart(4,"0")}.png` });
+      }
+    } else {
+      while (true) {
+        const soi = buf.indexOf(JPG_SOI);
+        const eoi = buf.indexOf(JPG_EOI, soi + 2);
+        if (soi === -1 || eoi === -1) break;
+        const frame = buf.slice(soi, eoi + 2);
+        buf = buf.slice(eoi + 2);
+        count++;
+        archive.append(frame, { name: `frame_${String(count).padStart(4,"0")}.jpg` });
+      }
+    }
   });
 
-  ff.on("close", async () => {
-    await archive.finalize();
+  ff.stderr.on("data", d => console.log("ffmpeg:", d.toString()));
+
+  ff.on("close", () => {
+    archive.finalize();
   });
+}
+
+// -------------------------------------
+// 📌 1) YOUTUBE LINK → FRAME EXTRACTOR
+// -------------------------------------
+app.post("/extract", async (req, res) => {
+  try {
+    const { url, maxFrames = 100, interval = "auto", format = "png" } = req.body;
+
+    if (!url) return res.status(400).json({ error: "Missing YouTube URL" });
+
+    const videoId = extractVideoId(url);
+    if (!videoId) return res.status(400).json({ error: "Invalid YouTube link" });
+
+    // get safe, bot-free URL
+    const directURL = await getYouTubeDownloadURL(videoId);
+
+    // tell ffmpeg to download directly
+    const videoPath = directURL;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
+
+    const archive = archiver("zip");
+    archive.pipe(res);
+
+    runFFmpeg(videoPath, maxFrames, interval, format, archive, res);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -------------------------------------
+// 📌 2) FILE UPLOAD → FRAME EXTRACTOR
+// -------------------------------------
+app.post("/upload", upload.single("video"), async (req, res) => {
+  try {
+    const file = req.file;
+    const { maxFrames = 100, interval = "auto", format = "png" } = req.body;
+
+    if (!file) return res.status(400).json({ error: "No video uploaded" });
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
+
+    const archive = archiver("zip");
+    archive.pipe(res);
+
+    runFFmpeg(file.path, maxFrames, interval, format, archive, res);
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 7860;
-app.listen(PORT, () => console.log("Server running on", PORT));
-
-
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
