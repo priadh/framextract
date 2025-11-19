@@ -4,8 +4,13 @@ import { spawn } from "child_process";
 import archiver from "archiver";
 import util from "util";
 import { exec } from "child_process";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const execPromise = util.promisify(exec);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
@@ -15,11 +20,6 @@ app.get("/", (req, res) => {
   res.send("Extractor API running... 🚀 Use POST /extract (JSON: { url, maxFrames, interval, format })");
 });
 
-/**
- * POST /extract
- * Body JSON: { url, maxFrames, interval, format }
- * Returns: ZIP
- */
 app.post("/extract", async (req, res) => {
   const { url, maxFrames = 100, interval = "auto", format = "png" } = req.body;
 
@@ -28,19 +28,25 @@ app.post("/extract", async (req, res) => {
   try {
     console.log("Downloading URL:", url);
 
-    // 1️⃣ Download the video using system yt-dlp → video.mp4
-    await execPromise(`yt-dlp -o video.mp4 "${url}"`);
+    const cookiesPath = path.join(__dirname, "cookies.txt");
+
+    // 1️⃣ Download using yt-dlp + cookies
+    const downloadCmd = `yt-dlp --cookies "${cookiesPath}" -o video.mp4 "${url}"`;
+
+    console.log("Running:", downloadCmd);
+
+    await execPromise(downloadCmd);
 
     console.log("Video downloaded.");
 
-    // 2️⃣ Setup ZIP response
+    // 2️⃣ Setup ZIP output
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
 
     const archive = archiver("zip");
     archive.pipe(res);
 
-    // 3️⃣ FFmpeg frame extraction
+    // 3️⃣ Start ffmpeg for frame extraction
     const codec = format === "jpg" ? "mjpeg" : "png";
     const fpsArg = interval !== "auto" ? `fps=1/${interval}` : "fps=1/5";
 
@@ -70,8 +76,10 @@ app.post("/extract", async (req, res) => {
         while ((idx = acc.indexOf(PNG_SIG)) !== -1) {
           let next = acc.indexOf(PNG_SIG, idx + PNG_SIG.length);
           if (next === -1) break;
+
           const frame = acc.slice(idx, next);
           acc = acc.slice(next);
+
           count++;
           archive.append(frame, { name: `frame_${String(count).padStart(4, "0")}.png` });
         }
@@ -80,8 +88,10 @@ app.post("/extract", async (req, res) => {
           const soi = acc.indexOf(JPG_SOI);
           const eoi = acc.indexOf(JPG_EOI, soi + 2);
           if (soi === -1 || eoi === -1) break;
+
           const frame = acc.slice(soi, eoi + 2);
           acc = acc.slice(eoi + 2);
+
           count++;
           archive.append(frame, { name: `frame_${String(count).padStart(4, "0")}.jpg` });
         }
