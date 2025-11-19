@@ -4,7 +4,7 @@ FROM ubuntu:22.04
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 1️⃣ Install system tools, FFmpeg, Python & pip
+# 1️⃣ Install system tools, FFmpeg, Python & pip, plus build tools
 RUN apt-get update && \
     apt-get install -y \
     curl \
@@ -13,6 +13,8 @@ RUN apt-get update && \
     netbase \
     python3 \
     python3-pip \
+    build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # 2️⃣ Install Node.js 20
