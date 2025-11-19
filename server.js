@@ -8,49 +8,49 @@ import { fileURLToPath } from "url";
 
 import fs from "fs";
 
+
+
 const app = express();
+
+// ✅ CORS FIX – allow all origins OR restrict to your domain
+app.use(cors({
+    origin: "*",          // OR replace with ["http://127.0.0.1:5500", "https://yourdomain.com"]
+    methods: "GET,POST",
+    allowedHeaders: "Content-Type"
+}));
+
 app.use(express.json());
 
-app.post("/download", async (req, res) => {
+app.post("/extract", async (req, res) => {
   const { url } = req.body;
 
   if (!url) {
     return res.status(400).json({ error: "No URL provided" });
   }
 
-  const outputFile = `video_${Date.now()}.mp4`;
-  const filePath = path.join("/app", outputFile);
+  const output = `video_${Date.now()}.mp4`;
+  const outputPath = path.join("/app", output);
 
-  // ⚠️ yt-dlp command WITHOUT cookies (safe mode)
-  // Works for all public YouTube videos
-  const command = `yt-dlp -f "best[ext=mp4]" -o "${filePath}" "${url}"`;
-
-  console.log("Running:", command);
+  const command = `yt-dlp -f "best[ext=mp4]" -o "${outputPath}" "${url}"`;
 
   exec(command, (err, stdout, stderr) => {
     if (err) {
-      console.error("yt-dlp error:", stderr);
       return res.status(500).json({
-        error: "Failed to download",
+        error: "Download failed",
         details: stderr,
       });
     }
 
-    console.log("yt-dlp output:", stdout);
-
-    if (!fs.existsSync(filePath)) {
-      return res.status(500).json({ error: "File not created" });
+    if (!fs.existsSync(outputPath)) {
+      return res.status(500).json({ error: "File not saved" });
     }
 
-    res.download(filePath, (downloadErr) => {
-      fs.unlink(filePath, () => {}); // cleanup
-      if (downloadErr) {
-        console.error("Download error:", downloadErr);
-      }
+    res.download(outputPath, () => {
+      fs.unlink(outputPath, () => {}); // cleanup
     });
   });
 });
 
-// Port for Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+t ${PORT}`));
