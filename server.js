@@ -10,17 +10,22 @@ import fs from "fs";
 
 
 
+
+import { exec } from "child_process";
+
+
 const app = express();
 
-// ✅ CORS FIX – allow all origins OR restrict to your domain
+// ✅ CORS FIX
 app.use(cors({
-    origin: "*",          // OR replace with ["http://127.0.0.1:5500", "https://yourdomain.com"]
+    origin: "*",
     methods: "GET,POST",
     allowedHeaders: "Content-Type"
 }));
 
 app.use(express.json());
 
+// API route
 app.post("/extract", async (req, res) => {
   const { url } = req.body;
 
@@ -51,6 +56,11 @@ app.post("/extract", async (req, res) => {
   });
 });
 
+// Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-t ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+
+});
+
+
