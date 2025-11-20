@@ -1,19 +1,16 @@
-# Dockerfile
-FROM node:20-bullseye
+FROM python:3.11-slim
 
-# install ffmpeg and tools
-RUN apt-get update && apt-get install -y ffmpeg ca-certificates curl && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# copy package files and install
-COPY package*.json ./
-RUN npm install --no-audit --no-fund
+# Copy and install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# copy source
+# Copy source
 COPY . .
 
-ENV PORT=7860
 EXPOSE 7860
-
-CMD ["node", "server.js"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
