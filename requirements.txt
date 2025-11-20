@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
+yt-dlp
 pytube
 opencv-python-headless
 python-multipart
