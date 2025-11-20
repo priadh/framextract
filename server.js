@@ -1,157 +1,84 @@
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import fetch from "node-fetch";
-import { spawn } from "child_process";
-import archiver from "archiver";
-import ytdl from "ytdl-core";
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pytube import YouTube
+import tempfile, zipfile, io, os, cv2
 
+app = FastAPI()
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "200mb" }));
+# Allow CORS for any frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-// storage for uploaded videos
-const upload = multer({ dest: "uploads/" });
+# ----------------------------
+# Utility: Extract frames
+# ----------------------------
+def extract_frames(video_path, max_frames: int = 100, interval: int = 5, fmt="png"):
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    count = 0
+    frame_id = 0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    step = int(fps * interval)
 
-const YT_API_KEY = "AIzaSyA6by9bsHyG_SJqxDq6ImSLtIrGtkXMRgA";
+    while count < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_id % step == 0:
+            is_success, buffer = cv2.imencode(f".{fmt}", frame)
+            if is_success:
+                frames.append(buffer.tobytes())
+                count += 1
+        frame_id += 1
 
-// ---------------------------
-// YOUTUBE METADATA + DOWNLOAD
-// ---------------------------
-async function getYouTubeDownloadURL(videoId) {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
+    cap.release()
+    return frames
 
-  // Get info using ytdl-core
-  const info = await ytdl.getInfo(url);
+# ----------------------------
+# Endpoint 1: YouTube URL
+# ----------------------------
+@app.post("/extract")
+async def extract_youtube(url: str = Form(...), max_frames: int = Form(100), interval: int = Form(5), fmt: str = Form("png")):
+    try:
+        yt = YouTube(url)
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first().download(tmp_file.name)
+        frames = extract_frames(tmp_file.name, max_frames, interval, fmt)
+        tmp_file.close()
+        os.unlink(tmp_file.name)
 
-  // Choose a progressive format (video + audio)
-  const format = ytdl.chooseFormat(info.formats, { quality: "highestvideo", filter: "videoandaudio" });
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            for i, f in enumerate(frames, 1):
+                zf.writestr(f"frame_{i:04d}.{fmt}", f)
+        zip_buffer.seek(0)
+        return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=frames.zip"})
+    except Exception as e:
+        return {"error": str(e)}
 
-  if (!format || !format.url) {
-    throw new Error("No playable stream URL found for this video");
-  }
+# ----------------------------
+# Endpoint 2: File Upload
+# ----------------------------
+@app.post("/upload")
+async def extract_upload(file: UploadFile = File(...), max_frames: int = Form(100), interval: int = Form(5), fmt: str = Form("png")):
+    try:
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
+        tmp_file.write(await file.read())
+        tmp_file.close()
 
-  return format.url;
-}
+        frames = extract_frames(tmp_file.name, max_frames, interval, fmt)
+        os.unlink(tmp_file.name)
 
-
-// extract videoId from link
-function extractVideoId(url) {
-  try {
-    const u = new URL(url);
-    if (u.hostname.includes("youtube.com")) return u.searchParams.get("v");
-    if (u.hostname.includes("youtu.be")) return u.pathname.substring(1);
-  } catch {}
-  return null;
-}
-
-// FRAME EXTRACTOR (common function)
-function runFFmpeg(videoPath, maxFrames, interval, format, archive, res) {
-  const codec = format === "jpg" ? "mjpeg" : "png";
-  const fpsArg = interval !== "auto" ? `fps=1/${interval}` : "fps=1/5";
-
-  const args = [
-    "-i", videoPath,
-    "-vf", fpsArg,
-    "-frames:v", String(maxFrames),
-    "-f", "image2pipe",
-    "-vcodec", codec,
-    "pipe:1"
-  ];
-
-  const ff = spawn("ffmpeg", args);
-
-  let buf = Buffer.alloc(0);
-  let count = 0;
-
-  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4E, 0x47]);
-  const JPG_SOI = Buffer.from([0xFF, 0xD8]);
-  const JPG_EOI = Buffer.from([0xFF, 0xD9]);
-
-  ff.stdout.on("data", chunk => {
-    buf = Buffer.concat([buf, chunk]);
-
-    if (format === "png") {
-      let idx;
-      while ((idx = buf.indexOf(PNG_SIG)) !== -1) {
-        let next = buf.indexOf(PNG_SIG, idx + 4);
-        if (next === -1) break;
-        const frame = buf.slice(idx, next);
-        buf = buf.slice(next);
-        count++;
-        archive.append(frame, { name: `frame_${String(count).padStart(4,"0")}.png` });
-      }
-    } else {
-      while (true) {
-        const soi = buf.indexOf(JPG_SOI);
-        const eoi = buf.indexOf(JPG_EOI, soi + 2);
-        if (soi === -1 || eoi === -1) break;
-        const frame = buf.slice(soi, eoi + 2);
-        buf = buf.slice(eoi + 2);
-        count++;
-        archive.append(frame, { name: `frame_${String(count).padStart(4,"0")}.jpg` });
-      }
-    }
-  });
-
-  ff.stderr.on("data", d => console.log("ffmpeg:", d.toString()));
-
-  ff.on("close", () => {
-    archive.finalize();
-  });
-}
-
-// -------------------------------------
-// 📌 1) YOUTUBE LINK → FRAME EXTRACTOR
-// -------------------------------------
-
-app.post("/extract", async (req, res) => {
-  try {
-    const { url, maxFrames = 100, interval = "auto", format = "png" } = req.body;
-
-    if (!url) return res.status(400).json({ error: "Missing YouTube URL" });
-
-    const info = await ytdl.getInfo(url);
-    const videoStreamURL = ytdl.chooseFormat(info.formats, { quality: "highestvideo" }).url;
-
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
-
-    const archive = archiver("zip");
-    archive.pipe(res);
-
-    runFFmpeg(videoStreamURL, maxFrames, interval, format, archive, res);
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
-// -------------------------------------
-// 📌 2) FILE UPLOAD → FRAME EXTRACTOR
-// -------------------------------------
-app.post("/upload", upload.single("video"), async (req, res) => {
-  try {
-    const file = req.file;
-    const { maxFrames = 100, interval = "auto", format = "png" } = req.body;
-
-    if (!file) return res.status(400).json({ error: "No video uploaded" });
-
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
-
-    const archive = archiver("zip");
-    archive.pipe(res);
-
-    runFFmpeg(file.path, maxFrames, interval, format, archive, res);
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zf:
+            for i, f in enumerate(frames, 1):
+                zf.writestr(f"frame_{i:04d}.{fmt}", f)
+        zip_buffer.seek(0)
+        return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": "attachment; filename=frames.zip"})
+    except Exception as e:
+        return {"error": str(e)}
