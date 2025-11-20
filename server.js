@@ -105,20 +105,15 @@ function runFFmpeg(videoPath, maxFrames, interval, format, archive, res) {
 // -------------------------------------
 // 📌 1) YOUTUBE LINK → FRAME EXTRACTOR
 // -------------------------------------
+
 app.post("/extract", async (req, res) => {
   try {
     const { url, maxFrames = 100, interval = "auto", format = "png" } = req.body;
 
     if (!url) return res.status(400).json({ error: "Missing YouTube URL" });
 
-    const videoId = extractVideoId(url);
-    if (!videoId) return res.status(400).json({ error: "Invalid YouTube link" });
-
-    // get safe, bot-free URL
-    const directURL = await getYouTubeDownloadURL(videoId);
-
-    // tell ffmpeg to download directly
-    const videoPath = directURL;
+    const info = await ytdl.getInfo(url);
+    const videoStreamURL = ytdl.chooseFormat(info.formats, { quality: "highestvideo" }).url;
 
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", "attachment; filename=frames.zip");
@@ -126,13 +121,14 @@ app.post("/extract", async (req, res) => {
     const archive = archiver("zip");
     archive.pipe(res);
 
-    runFFmpeg(videoPath, maxFrames, interval, format, archive, res);
+    runFFmpeg(videoStreamURL, maxFrames, interval, format, archive, res);
 
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // -------------------------------------
 // 📌 2) FILE UPLOAD → FRAME EXTRACTOR
