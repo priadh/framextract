@@ -1,8 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pytube import YouTube
-import tempfile, zipfile, io, os, cv2, shutil
+import tempfile, zipfile, io, os, cv2, shutil, glob
+
+# We use yt_dlp instead of pytube for reliability
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
 
 app = FastAPI()
 
@@ -15,12 +20,20 @@ app.add_middleware(
 )
 
 # ----------------------------
+# Endpoint 0: Health Check
+# ----------------------------
+@app.get("/")
+def read_root():
+    return {"message": "Video Frame Extractor API is running. Use /extract or /upload endpoints."}
+
+# ----------------------------
 # Utility: Extract frames
 # ----------------------------
 def extract_frames(video_path, max_frames: int = 100, interval: int = 5, fmt="png"):
     cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
+        print(f"Error: Could not open video file at {video_path}")
         return []
 
     frames = []
@@ -34,7 +47,6 @@ def extract_frames(video_path, max_frames: int = 100, interval: int = 5, fmt="pn
         if not ret:
             break
         
-        # Logic to capture frame at interval
         if frame_id % step == 0:
             is_success, buffer = cv2.imencode(f".{fmt}", frame)
             if is_success:
@@ -46,7 +58,7 @@ def extract_frames(video_path, max_frames: int = 100, interval: int = 5, fmt="pn
     return frames
 
 # ----------------------------
-# Endpoint 1: YouTube URL
+# Endpoint 1: YouTube URL (Updated to yt-dlp)
 # ----------------------------
 @app.post("/extract")
 async def extract_youtube(
@@ -55,30 +67,42 @@ async def extract_youtube(
     interval: int = Form(5), 
     fmt: str = Form("png")
 ):
+    if yt_dlp is None:
+        raise HTTPException(status_code=500, detail="yt-dlp is not installed on the server. Please add it to requirements.txt")
+
     temp_dir = None
     try:
-        # 1. Use a Temporary Directory, not a file, for the download path
+        # Use a temporary directory for the download
         temp_dir = tempfile.mkdtemp()
         
-        yt = YouTube(url)
-        
-        # Pytube is often unstable. Get the stream first.
-        stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
-        
-        if not stream:
-            raise HTTPException(status_code=400, detail="Could not find a valid video stream.")
+        # yt-dlp configuration
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',  # Prefer MP4, single file
+            'outtmpl': os.path.join(temp_dir, 'video.%(ext)s'),
+            'quiet': True,
+            'noplaylist': True,
+        }
 
-        # Download to the temp dir with a specific filename
-        video_path = stream.download(output_path=temp_dir, filename="video.mp4")
+        # Download the video
+        print(f"Attempting to download: {url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
         
+        # Find the downloaded file (extension might vary)
+        files = glob.glob(os.path.join(temp_dir, "video.*"))
+        if not files:
+            raise HTTPException(status_code=400, detail="Video download failed. No file found.")
+        
+        video_path = files[0]
+        print(f"Video downloaded to: {video_path}")
+
         # Extract frames
         frames = extract_frames(video_path, max_frames, interval, fmt)
 
-        # 2. CRITICAL FIX: Check if frames were actually extracted
         if not frames:
-            raise HTTPException(status_code=400, detail="No frames extracted. Video might be unreadable or protected.")
+            raise HTTPException(status_code=400, detail="No frames extracted. The video might be unreadable by OpenCV.")
 
-        # Create Zip in memory
+        # Create Zip
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, f in enumerate(frames, 1):
@@ -93,11 +117,10 @@ async def extract_youtube(
         )
 
     except Exception as e:
-        # Return a proper JSON error, not a broken file
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error processing YouTube URL: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
         
     finally:
-        # Cleanup the directory
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
@@ -120,7 +143,6 @@ async def extract_upload(
 
         frames = extract_frames(temp_path, max_frames, interval, fmt)
         
-        # CRITICAL FIX: Check for empty frames
         if not frames:
             raise HTTPException(status_code=400, detail="No frames extracted from uploaded file.")
 
