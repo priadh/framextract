@@ -18,19 +18,21 @@ const YT_API_KEY = "AIzaSyA6by9bsHyG_SJqxDq6ImSLtIrGtkXMRgA";
 // YOUTUBE METADATA + DOWNLOAD
 // ---------------------------
 async function getYouTubeDownloadURL(videoId) {
-  const apiURL = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&part=contentDetails,player&key=${YT_API_KEY}`;
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  const res = await fetch(apiURL);
-  const data = await res.json();
+  // Get info using ytdl-core
+  const info = await ytdl.getInfo(url);
 
-  if (!data.items || data.items.length === 0) {
-    throw new Error("Invalid or private YouTube video");
+  // Choose a progressive format (video + audio)
+  const format = ytdl.chooseFormat(info.formats, { quality: "highestvideo", filter: "videoandaudio" });
+
+  if (!format || !format.url) {
+    throw new Error("No playable stream URL found for this video");
   }
 
-  // We DO NOT need yt-dlp.
-  // We use YouTube's "player embed" URL for direct access:
-  return `https://www.youtube.com/watch?v=${videoId}`;
+  return format.url;
 }
+
 
 // extract videoId from link
 function extractVideoId(url) {
