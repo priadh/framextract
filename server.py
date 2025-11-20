@@ -1,13 +1,19 @@
 # server.py
+import os
+import tempfile
+import zipfile
+import cv2
+import io
+import subprocess
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pytube import YouTube
-import tempfile, zipfile, io, os, cv2
 
 app = FastAPI(title="Frame Extractor")
 
-# Allow CORS for any frontend
+# ===============================
+# CORS
+# ===============================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,38 +21,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# Utility: Extract frames
-# ----------------------------
-def extract_frames(video_path, max_frames: int = 100, interval: int = 5, fmt="png"):
+
+# ===============================
+# HELPER: Extract frames
+# ===============================
+def extract_frames(video_path, max_frames=100, interval=5, fmt="png"):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise Exception("Cannot open video")
 
     frames = []
-    count = 0
     frame_id = 0
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    count = 0
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps if fps and fps > 0 else 30
+
     step = max(int(fps * interval), 1)
 
     while count < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
+
         if frame_id % step == 0:
-            if frame is not None and frame.size > 0:
-                is_success, buffer = cv2.imencode(f".{fmt}", frame)
-                if is_success:
-                    frames.append(buffer.tobytes())
-                    count += 1
+            is_success, buffer = cv2.imencode(f".{fmt}", frame)
+            if is_success:
+                frames.append(buffer.tobytes())
+                count += 1
+
         frame_id += 1
 
     cap.release()
     return frames
 
-# ----------------------------
-# Endpoint 1: YouTube URL
-# ----------------------------
+
+# ===============================
+# HELPER: Safe YouTube download using yt-dlp
+# pytube breaks often → replaced
+# ===============================
+def download_youtube_video(url):
+    # Convert shorts links
+    if "shorts/" in url:
+        vid = url.split("shorts/")[1].split("?")[0]
+        url = f"https://www.youtube.com/watch?v={vid}"
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp.close()
+
+    cmd = [
+        "yt-dlp",
+        "-f",
+        "mp4",
+        "-o",
+        tmp.name,
+        "--no-warnings",
+        url
+    ]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if result.returncode != 0:
+        raise Exception("Failed to download video. YouTube URL is invalid or blocked.")
+
+    return tmp.name
+
+
+# ===============================
+# API 1: Extract from YouTube
+# ===============================
 @app.post("/extract")
 async def extract_youtube(
     url: str = Form(...),
@@ -55,28 +98,21 @@ async def extract_youtube(
     fmt: str = Form("png")
 ):
     try:
-        # Download YouTube video to temp file
-        yt = YouTube(url)
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        stream = yt.streams.filter(progressive=True, file_extension="mp4") \
-                    .order_by("resolution").desc().first()
-        if not stream:
-            return JSONResponse({"error": "No suitable video stream found"}, status_code=400)
-        stream.download(tmp_file.name)
-        tmp_file.close()
+        video_path = download_youtube_video(url)
 
-        frames = extract_frames(tmp_file.name, max_frames, interval, fmt)
-        os.unlink(tmp_file.name)  # delete temp video
+        frames = extract_frames(video_path, max_frames, interval, fmt)
+        os.unlink(video_path)
 
-        # Create temporary zip file
-        tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        with zipfile.ZipFile(tmp_zip.name, "w") as zf:
+        # ZIP creation
+        mem_zip = io.BytesIO()
+        with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, f in enumerate(frames, 1):
                 zf.writestr(f"frame_{i:04d}.{fmt}", f)
-        tmp_zip.close()
+
+        mem_zip.seek(0)
 
         return StreamingResponse(
-            open(tmp_zip.name, "rb"),
+            mem_zip,
             media_type="application/zip",
             headers={"Content-Disposition": "attachment; filename=frames.zip"}
         )
@@ -84,9 +120,10 @@ async def extract_youtube(
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# ----------------------------
-# Endpoint 2: File Upload
-# ----------------------------
+
+# ===============================
+# API 2: Extract from upload
+# ===============================
 @app.post("/upload")
 async def extract_upload(
     file: UploadFile = File(...),
@@ -95,27 +132,35 @@ async def extract_upload(
     fmt: str = Form("png")
 ):
     try:
-        # Save uploaded file to temp
         suffix = os.path.splitext(file.filename)[1]
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp_file.write(await file.read())
-        tmp_file.close()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(await file.read())
+        tmp.close()
 
-        frames = extract_frames(tmp_file.name, max_frames, interval, fmt)
-        os.unlink(tmp_file.name)  # delete temp video
+        frames = extract_frames(tmp.name, max_frames, interval, fmt)
+        os.unlink(tmp.name)
 
-        # Create temp zip
-        tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        with zipfile.ZipFile(tmp_zip.name, "w") as zf:
+        mem_zip = io.BytesIO()
+        with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, f in enumerate(frames, 1):
                 zf.writestr(f"frame_{i:04d}.{fmt}", f)
-        tmp_zip.close()
+
+        mem_zip.seek(0)
 
         return StreamingResponse(
-            open(tmp_zip.name, "rb"),
+            mem_zip,
             media_type="application/zip",
             headers={"Content-Disposition": "attachment; filename=frames.zip"}
         )
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ===============================
+# RENDER PORT FIX (IMPORTANT)
+# ===============================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
