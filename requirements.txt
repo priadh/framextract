@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pytube
+opencv-python-headless
+python-multipart
