@@ -1,104 +1,112 @@
-# server.py
-from fastapi import FastAPI, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-import tempfile, zipfile, os, cv2, requests, urllib.parse
+from fastapi import FastAPI
+import requests
+import re
+import json
+import cv2
+import os
 
-app = FastAPI(title="Frame Extractor Without ytdlp")
+app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ----------------------------
+# Load YouTube Cookies
+# ----------------------------
+def load_cookies(file_path="cookies.txt"):
+    cookies = {}
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.startswith("#") and "\t" in line:
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookies[parts[5]] = parts[6].strip()
+    return cookies
 
-# -------------------------
-# Utility: Extract frames
-# -------------------------
-def extract_frames_from_stream(url, max_frames=100, interval=5, fmt="png"):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    
-    with requests.get(url, stream=True) as r:
-        for chunk in r.iter_content(chunk_size=1024*1024):
+
+# ----------------------------
+# Extract Video Stream URL
+# ----------------------------
+def get_stream_url(video_id):
+    cookies = load_cookies()
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    r = requests.get(url, headers=headers, cookies=cookies)
+
+    if "ytInitialPlayerResponse" not in r.text:
+        return None, "Failed: Cookies expired or video not accessible"
+
+    match = re.search(r"ytInitialPlayerResponse\s*=\s*(\{.*?\});", r.text)
+    if not match:
+        return None, "Player response JSON missing"
+
+    data = json.loads(match.group(1))
+
+    formats = data["streamingData"]["formats"]
+
+    for f in formats:
+        if "video/mp4" in f.get("mimeType", ""):
+            return f["url"], None
+
+    return None, "MP4 stream not found"
+
+
+# ----------------------------
+# Download the Video
+# ----------------------------
+def download_video(video_url, output_path="video.mp4"):
+    r = requests.get(video_url, stream=True)
+    if r.status_code != 200:
+        return False
+
+    with open(output_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
             if chunk:
-                tmp.write(chunk)
-    tmp.close()
+                f.write(chunk)
 
-    frames = []
-    cap = cv2.VideoCapture(tmp.name)
+    return True
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    step = int(fps * interval)
-    frame_id = 0
-    count = 0
 
-    while count < max_frames:
+# ----------------------------
+# Extract Frames using OpenCV
+# ----------------------------
+def extract_frames(video_path="video.mp4", output_folder="frames"):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    cap = cv2.VideoCapture(video_path)
+    frame_no = 0
+
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_id % step == 0:
-            ok, buf = cv2.imencode(f".{fmt}", frame)
-            if ok:
-                frames.append(buf.tobytes())
-                count += 1
-
-        frame_id += 1
+        cv2.imwrite(f"{output_folder}/frame_{frame_no}.jpg", frame)
+        frame_no += 1
 
     cap.release()
-    os.unlink(tmp.name)
-    return frames
+    return frame_no
 
-# -------------------------
-# Helper: Get direct MP4 URL
-# -------------------------
-def get_direct_mp4_url(video_url):
-    video_id = urllib.parse.parse_qs(urllib.parse.urlparse(video_url).query).get("v")
-    if not video_id:
-        return None
-    video_id = video_id[0]
 
-    info_url = f"https://youtube.com/get_video_info?video_id={video_id}&el=detailpage"
-    data = requests.get(info_url).text
+# ----------------------------
+# API ROUTE
+# ----------------------------
+@app.get("/process_video")
+def process_video(video_id: str):
+    stream_url, error = get_stream_url(video_id)
 
-    parsed = urllib.parse.parse_qs(data)
-    if "player_response" not in parsed:
-        return None
+    if error:
+        return {"error": error}
 
-    import json
-    pr = json.loads(parsed["player_response"][0])
+    ok = download_video(stream_url)
+    if not ok:
+        return {"error": "Failed to download MP4 file"}
 
-    formats = pr["streamingData"]["formats"]
-    for f in formats:
-        if "video/mp4" in f["mimeType"]:
-            return f["url"]
+    total_frames = extract_frames("video.mp4")
 
-    return None
-
-# -------------------------
-# API Endpoint
-# -------------------------
-@app.post("/extract")
-async def extract(url: str = Form(...), max_frames: int = Form(100), interval: int = Form(5), fmt: str = Form("png")):
-    try:
-        mp4_url = get_direct_mp4_url(url)
-        if not mp4_url:
-            return JSONResponse({"error": "Could not retrieve MP4 stream"}, status_code=400)
-
-        frames = extract_frames_from_stream(mp4_url, max_frames, interval, fmt)
-
-        tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-        with zipfile.ZipFile(tmp_zip.name, "w") as zf:
-            for i, f in enumerate(frames, 1):
-                zf.writestr(f"frame_{i:04d}.{fmt}", f)
-        tmp_zip.close()
-
-        return StreamingResponse(
-            open(tmp_zip.name, "rb"),
-            media_type="application/zip",
-            headers={"Content-Disposition": "attachment; filename=frames.zip"}
-        )
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    return {
+        "message": "Success",
+        "downloaded": True,
+        "frames_extracted": total_frames,
+        "frames_folder": "frames/"
+    }
