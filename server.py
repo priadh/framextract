@@ -58,7 +58,7 @@ def extract_frames(video_path, max_frames: int = 100, interval: int = 5, fmt="pn
     return frames
 
 # ----------------------------
-# Endpoint 1: YouTube URL (Updated to yt-dlp)
+# Endpoint 1: YouTube URL (Updated to yt-dlp with Anti-Bot Bypass)
 # ----------------------------
 @app.post("/extract")
 async def extract_youtube(
@@ -75,16 +75,27 @@ async def extract_youtube(
         # Use a temporary directory for the download
         temp_dir = tempfile.mkdtemp()
         
-        # yt-dlp configuration
+        # yt-dlp configuration with Anti-Bot Bypass
         ydl_opts = {
-            'format': 'best[ext=mp4]/best',  # Prefer MP4, single file
+            'format': 'best[ext=mp4]/best',
             'outtmpl': os.path.join(temp_dir, 'video.%(ext)s'),
             'quiet': True,
             'noplaylist': True,
+            # CRITICAL FIX: Mimic Android/iOS client to bypass "Sign in to confirm you're not a bot"
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios'],
+                }
+            },
+            # Add headers to look like a real browser request
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
         }
 
         # Download the video
-        print(f"Attempting to download: {url}")
+        print(f"Attempting to download: {url} using Android client emulation...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
@@ -118,7 +129,8 @@ async def extract_youtube(
 
     except Exception as e:
         print(f"Error processing YouTube URL: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+        # Return the actual error so we can debug if it happens again
+        raise HTTPException(status_code=500, detail=f"YouTube Download Error: {str(e)}")
         
     finally:
         if temp_dir and os.path.exists(temp_dir):
