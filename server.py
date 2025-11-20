@@ -1,17 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse
+# server.py
+from fastapi import FastAPI, Form
 from fastapi.middleware.cors import CORSMiddleware
-import tempfile, zipfile, io, os, cv2, shutil, glob
+from fastapi.responses import JSONResponse, StreamingResponse
+import tempfile, zipfile, os, cv2, requests, urllib.parse
 
-# We use yt_dlp instead of pytube for reliability
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
+app = FastAPI(title="Frame Extractor Without ytdlp")
 
-app = FastAPI()
-
-# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,160 +13,92 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# Endpoint 0: Health Check
-# ----------------------------
-@app.get("/")
-def read_root():
-    return {"message": "Video Frame Extractor API is running. Use /extract or /upload endpoints."}
-
-# ----------------------------
+# -------------------------
 # Utility: Extract frames
-# ----------------------------
-def extract_frames(video_path, max_frames: int = 100, interval: int = 5, fmt="png"):
-    cap = cv2.VideoCapture(video_path)
+# -------------------------
+def extract_frames_from_stream(url, max_frames=100, interval=5, fmt="png"):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     
-    if not cap.isOpened():
-        print(f"Error: Could not open video file at {video_path}")
-        return []
+    with requests.get(url, stream=True) as r:
+        for chunk in r.iter_content(chunk_size=1024*1024):
+            if chunk:
+                tmp.write(chunk)
+    tmp.close()
 
     frames = []
-    count = 0
-    frame_id = 0
+    cap = cv2.VideoCapture(tmp.name)
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     step = int(fps * interval)
+    frame_id = 0
+    count = 0
 
     while count < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
-        
+
         if frame_id % step == 0:
-            is_success, buffer = cv2.imencode(f".{fmt}", frame)
-            if is_success:
-                frames.append(buffer.tobytes())
+            ok, buf = cv2.imencode(f".{fmt}", frame)
+            if ok:
+                frames.append(buf.tobytes())
                 count += 1
+
         frame_id += 1
 
     cap.release()
+    os.unlink(tmp.name)
     return frames
 
-# ----------------------------
-# Endpoint 1: YouTube URL (Updated to yt-dlp with Anti-Bot Bypass)
-# ----------------------------
+# -------------------------
+# Helper: Get direct MP4 URL
+# -------------------------
+def get_direct_mp4_url(video_url):
+    video_id = urllib.parse.parse_qs(urllib.parse.urlparse(video_url).query).get("v")
+    if not video_id:
+        return None
+    video_id = video_id[0]
+
+    info_url = f"https://youtube.com/get_video_info?video_id={video_id}&el=detailpage"
+    data = requests.get(info_url).text
+
+    parsed = urllib.parse.parse_qs(data)
+    if "player_response" not in parsed:
+        return None
+
+    import json
+    pr = json.loads(parsed["player_response"][0])
+
+    formats = pr["streamingData"]["formats"]
+    for f in formats:
+        if "video/mp4" in f["mimeType"]:
+            return f["url"]
+
+    return None
+
+# -------------------------
+# API Endpoint
+# -------------------------
 @app.post("/extract")
-async def extract_youtube(
-    url: str = Form(...), 
-    max_frames: int = Form(100), 
-    interval: int = Form(5), 
-    fmt: str = Form("png")
-):
-    if yt_dlp is None:
-        raise HTTPException(status_code=500, detail="yt-dlp is not installed on the server. Please add it to requirements.txt")
-
-    temp_dir = None
+async def extract(url: str = Form(...), max_frames: int = Form(100), interval: int = Form(5), fmt: str = Form("png")):
     try:
-        # Use a temporary directory for the download
-        temp_dir = tempfile.mkdtemp()
-        
-        # yt-dlp configuration with Anti-Bot Bypass
-        ydl_opts = {
-            'format': 'best[ext=mp4]/best',
-            'outtmpl': os.path.join(temp_dir, 'video.%(ext)s'),
-            'quiet': True,
-            'noplaylist': True,
-            # CRITICAL FIX: Mimic Android/iOS client to bypass "Sign in to confirm you're not a bot"
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios'],
-                }
-            },
-            # Add headers to look like a real browser request
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-            }
-        }
+        mp4_url = get_direct_mp4_url(url)
+        if not mp4_url:
+            return JSONResponse({"error": "Could not retrieve MP4 stream"}, status_code=400)
 
-        # Download the video
-        print(f"Attempting to download: {url} using Android client emulation...")
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        
-        # Find the downloaded file (extension might vary)
-        files = glob.glob(os.path.join(temp_dir, "video.*"))
-        if not files:
-            raise HTTPException(status_code=400, detail="Video download failed. No file found.")
-        
-        video_path = files[0]
-        print(f"Video downloaded to: {video_path}")
+        frames = extract_frames_from_stream(mp4_url, max_frames, interval, fmt)
 
-        # Extract frames
-        frames = extract_frames(video_path, max_frames, interval, fmt)
-
-        if not frames:
-            raise HTTPException(status_code=400, detail="No frames extracted. The video might be unreadable by OpenCV.")
-
-        # Create Zip
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        with zipfile.ZipFile(tmp_zip.name, "w") as zf:
             for i, f in enumerate(frames, 1):
                 zf.writestr(f"frame_{i:04d}.{fmt}", f)
-        
-        zip_buffer.seek(0)
-        
+        tmp_zip.close()
+
         return StreamingResponse(
-            zip_buffer, 
-            media_type="application/zip", 
+            open(tmp_zip.name, "rb"),
+            media_type="application/zip",
             headers={"Content-Disposition": "attachment; filename=frames.zip"}
         )
 
     except Exception as e:
-        print(f"Error processing YouTube URL: {str(e)}")
-        # Return the actual error so we can debug if it happens again
-        raise HTTPException(status_code=500, detail=f"YouTube Download Error: {str(e)}")
-        
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-
-# ----------------------------
-# Endpoint 2: File Upload
-# ----------------------------
-@app.post("/upload")
-async def extract_upload(
-    file: UploadFile = File(...), 
-    max_frames: int = Form(100), 
-    interval: int = Form(5), 
-    fmt: str = Form("png")
-):
-    temp_path = None
-    try:
-        # Write uploaded file to temp disk
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-            tmp.write(await file.read())
-            temp_path = tmp.name
-
-        frames = extract_frames(temp_path, max_frames, interval, fmt)
-        
-        if not frames:
-            raise HTTPException(status_code=400, detail="No frames extracted from uploaded file.")
-
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, f in enumerate(frames, 1):
-                zf.writestr(f"frame_{i:04d}.{fmt}", f)
-        
-        zip_buffer.seek(0)
-        return StreamingResponse(
-            zip_buffer, 
-            media_type="application/zip", 
-            headers={"Content-Disposition": "attachment; filename=frames.zip"}
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.unlink(temp_path)
+        return JSONResponse({"error": str(e)}, status_code=500)
