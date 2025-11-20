@@ -1,20 +1,21 @@
-# Dockerfile
-FROM python:3.11-slim
+FROM node:20-bullseye
 
-# Install ffmpeg & yt-dlp
-RUN apt-get update && apt-get install -y ffmpeg yt-dlp
+# Install ffmpeg and yt-dlp
+RUN apt-get update && \
+    apt-get install -y ffmpeg python3-pip && \
+    pip3 install yt-dlp && \
+    rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy package files first for better cache
+COPY package*.json ./
+RUN npm install --no-audit --no-fund
 
-# Copy source
+# Copy rest
 COPY . .
 
 ENV PORT=7860
 EXPOSE 7860
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["node", "server.js"]
