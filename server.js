@@ -6,7 +6,6 @@ import { fileURLToPath } from "url";
 import { glob } from "glob";
 import { exec } from "child_process";
 import multer from "multer";
-import cv from "@u4/opencv4nodejs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
