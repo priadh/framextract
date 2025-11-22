@@ -16,63 +16,44 @@ app.use(express.json());
 
 const upload = multer({ dest: "uploads/" });
 
-// ----------- Utility: Extract Frames -----------
-async function extractFrames(videoPath, outDir, maxFrames = 100, interval = 5, fmt = "jpg") {
+// -------- Frame Extraction using FFmpeg --------
+async function extractFramesFFmpeg(videoPath, outDir, fps = 1) {
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir);
 
-    const cap = new cv.VideoCapture(videoPath);
-    const fps = cap.get(cv.CAP_PROP_FPS) || 30;
-    const step = Math.max(parseInt(fps * interval), 1);
+    return new Promise((resolve, reject) => {
+        const cmd = `ffmpeg -i "${videoPath}" -vf fps=${fps} "${outDir}/frame_%04d.jpg" -hide_banner -loglevel error`;
 
-    let count = 0;
-    let frameId = 0;
-
-    while (count < maxFrames) {
-        let frame = cap.read();
-        if (!frame || frame.empty) break;
-
-        if (frameId % step === 0) {
-            const outFile = path.join(outDir, `frame_${String(count).padStart(4, "0")}.${fmt}`);
-            cv.imwrite(outFile, frame);
-            count++;
-        }
-
-        frameId++;
-    }
-
-    return count;
+        exec(cmd, (err) => {
+            if (err) return reject(err);
+            glob(`${outDir}/frame_*.jpg`).then(files => resolve(files.length));
+        });
+    });
 }
 
-// ----------- 🎯 YouTube URL Extraction -----------
+// --------- YouTube URL → Frames ---------
 app.post("/extract", upload.none(), async (req, res) => {
     try {
-        const { url, maxFrames = 100, interval = 5, fmt = "jpg" } = req.body;
+        const { url } = req.body;
 
         if (!url) return res.status(400).json({ error: "URL required" });
 
         const tmpDir = "tmp";
         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
 
-        const ytCmd = `yt-dlp -f "mp4" -o "${tmpDir}/video.%(ext)s" "${url}"`;
-        console.log("Running:", ytCmd);
+        const ytCmd = `yt-dlp -f mp4 -o "${tmpDir}/video.%(ext)s" "${url}"`;
 
         exec(ytCmd, async (err) => {
-            if (err) {
-                console.error(err);
-                return res.status(500).json({ error: "yt-dlp failed" });
-            }
+            if (err) return res.status(500).json({ error: "yt-dlp failed" });
 
             const files = await glob(`${tmpDir}/video.*`);
-            if (!files.length) return res.status(500).json({ error: "Video not downloaded" });
+            if (!files.length) return res.status(500).json({ error: "Video download failed" });
 
             const videoPath = files[0];
             const framesDir = path.join(tmpDir, "frames");
-            if (!fs.existsSync(framesDir)) fs.mkdirSync(framesDir);
 
-            await extractFrames(videoPath, framesDir, maxFrames, interval, fmt);
+            const totalFrames = await extractFramesFFmpeg(videoPath, framesDir, 1);
 
-            const frameFiles = await glob(`${framesDir}/frame_*.${fmt}`);
-            if (!frameFiles.length) return res.status(500).json({ error: "No frames extracted" });
+            const frameFiles = await glob(`${framesDir}/frame_*.jpg`);
 
             return res.json({
                 message: "Frames extracted",
@@ -82,30 +63,10 @@ app.post("/extract", upload.none(), async (req, res) => {
         });
 
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Server error", detail: err.toString() });
-    }
-});
-
-// ----------- Upload Video -----------
-app.post("/upload", upload.single("file"), async (req, res) => {
-    try {
-        const videoPath = req.file.path;
-        const framesDir = `uploads/frames_${Date.now()}`;
-        const { maxFrames = 100, interval = 5, fmt = "jpg" } = req.body;
-
-        const total = await extractFrames(videoPath, framesDir, maxFrames, interval, fmt);
-
-        return res.json({
-            message: "Frames extracted from uploaded file",
-            total_frames: total,
-            folder: framesDir
-        });
-    } catch (err) {
         res.status(500).json({ error: err.toString() });
     }
 });
 
-// ----------- Server Start -----------
+// -------- Server --------
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
