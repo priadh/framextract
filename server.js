@@ -40,7 +40,9 @@ app.post("/extract", upload.none(), async (req, res) => {
         const tmpDir = "tmp";
         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
 
-        const ytCmd = `yt-dlp -f mp4 -o "${tmpDir}/video.%(ext)s" "${url}"`;
+const ytCmd = `yt-dlp --cookies ./cookies.txt -f "mp4" \
+    -o "${tmpDir}/video.%(ext)s" "${url}"`;
+
 
         exec(ytCmd, async (err) => {
             if (err) return res.status(500).json({ error: "yt-dlp failed" });
